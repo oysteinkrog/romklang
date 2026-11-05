@@ -1,0 +1,16 @@
+[Unit]
+Description=romklang convolver (virtual surround and headphone EQ)
+Documentation=https://github.com/oysteinkrog/romklang
+After=pipewire.service
+BindsTo=pipewire.service
+
+[Service]
+# Rebuild the impulse responses if the settings or source files changed.
+ExecStartPre=%h/.local/bin/romklang render --if-stale
+ExecStart=/usr/bin/pipewire -c romklang.conf
+Restart=on-failure
+RestartSec=2
+Slice=session.slice
+
+[Install]
+WantedBy=pipewire.service

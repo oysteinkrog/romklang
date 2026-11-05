@@ -1,0 +1,1149 @@
+#!/usr/bin/python3
+"""romklang: HeSuVi-style virtual surround and headphone EQ for PipeWire.
+
+Pick any HRIR (virtual speakers) and any headphone EQ, and switch while music
+plays. Apps play into a stable sink. Its output goes to a hidden convolver sink
+run by romklang.service, which this tool restarts after it writes new impulse
+responses. Apps keep their sink while the filter is swapped.
+
+  romklang setup --output NODE        one-time: stable sink, output device, service
+  romklang status                     current choice
+  romklang list hrir|eq|outputs [TEXT]
+  romklang set [--hrir N] [--eq N] [--upmix auto|on|off] [--gain DB] [--output NODE]
+  romklang gui                        the picker window
+  romklang import HESUVI_DIR          copy hrir/ and eq/ from a HeSuVi install
+  romklang render [--if-stale]        write the PipeWire config and IRs (used by the unit)
+
+Data: ~/.local/share/romklang (hrir/, hrir/44/, hrir/more/, eq/, fir/).
+Settings: ~/.config/romklang/defaults.json (optional, for example a machine
+profile) and state.json (what you set; it wins over the defaults).
+Headphone FIR folders: ~/.local/share/romklang/fir/NAME/{44100,48000}.wav and
+~/.config/romklang/fir/NAME/...
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+VERSION = "0.1.0"
+# Bump when build_ir changes its output, so cached IRs are rebuilt.
+RENDER_VERSION = 2
+
+DATA = Path(os.environ.get("ROMKLANG_DATA", Path.home() / ".local/share/romklang"))
+CONF_DIR = Path(os.environ.get("ROMKLANG_CONFIG", Path.home() / ".config/romklang"))
+STATE = CONF_DIR / "state.json"
+DEFAULTS = CONF_DIR / "defaults.json"
+LOCK = CONF_DIR / ".lock"
+ACTIVE = DATA / "active"
+MANIFEST = ACTIVE / "built-from.json"
+FIR_DIRS = (DATA / "fir", CONF_DIR / "fir")
+PW_DIR = Path.home() / ".config/pipewire"
+PW_CONF = PW_DIR / "romklang.conf"
+SINK_CONF = PW_DIR / "pipewire.conf.d/romklang-sink.conf"
+UNIT = "romklang.service"
+RATES = (48000, 44100)
+EQ_NONE = "none"
+NODE_IN = "romklang_input"
+NODE_OUT = "romklang_output"
+SINK_NODE = "romklang"
+SINK_STREAM = "romklang_sink_output"
+
+BASE_STATE = {
+    "hrir": "dht-",
+    "eq": EQ_NONE,
+    "upmix": "auto",
+    "gain_db": 0.0,
+    "output": "",
+}
+
+# HeSuVi's stereo to 7.1 matrix (matrix.txt): speaker -> (from L, from R).
+UPMIX = {
+    "FL": (0.5, 0.0),
+    "FR": (0.0, 0.5),
+    "FC": (0.2, 0.2),
+    "RL": (0.3, -0.2),
+    "RR": (-0.2, 0.3),
+    "SL": (0.45, -0.25),
+    "SR": (-0.25, 0.45),
+}
+NO_UPMIX = {"FL": (1.0, 0.0), "FR": (0.0, 1.0)}
+# Channel order of a 14-channel HeSuVi HRIR: (speaker, ear).
+LAYOUT14 = [
+    ("FL", "L"),
+    ("FL", "R"),
+    ("SL", "L"),
+    ("SL", "R"),
+    ("RL", "L"),
+    ("RL", "R"),
+    ("FC", "L"),
+    ("FR", "R"),
+    ("FR", "L"),
+    ("SR", "R"),
+    ("SR", "L"),
+    ("RR", "R"),
+    ("RR", "L"),
+    ("FC", "R"),
+]
+# A 7-channel HRIR holds the left speakers and the centre: L-L, L-R, SL-L, SL-R,
+# RL-L, RL-R, C. The right speakers mirror the left ones, and C feeds both ears.
+# Worked out from the energy and onset of each channel, not from HeSuVi's source.
+SEVEN_TO_14 = [0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6]
+
+EQ_TAPS = 8192
+EQ_FFT = 65536
+# Tail below this, relative to the IR peak, is cut (-120 dB).
+TRIM_REL = 1e-6
+
+
+def die(msg):
+    raise SystemExit(f"romklang: {msg}")
+
+
+# ---------------------------------------------------------------- state
+
+
+def _read_json(p):
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text())
+    except (OSError, ValueError) as e:
+        print(f"romklang: ignoring {p}: {e}", file=sys.stderr)
+        return {}
+    return {k: v for k, v in d.items() if k in BASE_STATE}
+
+
+def load_user_state():
+    """Only the keys the user set. The defaults stay live for the rest."""
+    return _read_json(STATE)
+
+
+def load_state():
+    st = dict(BASE_STATE)
+    st.update(_read_json(DEFAULTS))
+    st.update(load_user_state())
+    return check_state(st)
+
+
+def check_state(st):
+    if st["upmix"] not in ("auto", "on", "off"):
+        die(f"upmix must be auto, on or off, not {st['upmix']!r}")
+    try:
+        st["gain_db"] = float(st["gain_db"])
+    except (TypeError, ValueError):
+        die(f"gain_db must be a number, not {st['gain_db']!r}")
+    if not -60.0 <= st["gain_db"] <= 30.0:
+        die(f"gain_db {st['gain_db']} is outside -60..30")
+    for k in ("hrir", "eq", "output"):
+        if not isinstance(st[k], str):
+            die(f"{k} must be a string")
+    if st["output"] in (NODE_IN, NODE_OUT, SINK_NODE, SINK_STREAM):
+        die(f"output {st['output']!r} is romklang's own node; pick the real device")
+    return st
+
+
+def _write_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    if isinstance(data, str):
+        tmp.write_text(data)
+    else:
+        tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def save_user_state(user):
+    _write_atomic(STATE, json.dumps(user, indent=2, sort_keys=True) + "\n")
+
+
+@contextmanager
+def locked():
+    """Serialise builds. Never hold this across a unit restart: the unit's
+    ExecStartPre runs `romklang render`, which takes the same lock."""
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------- catalogue
+
+
+def _read_info(path):
+    info = {}
+    if not path.exists():
+        return info
+    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        if ";" in line:
+            k, v = line.split(";", 1)
+            info[k.strip()] = v.strip().replace("/n", "\n")
+    return info
+
+
+def _describe(name, info):
+    if name in info:
+        return info[name]
+    for k, v in info.items():
+        if k.endswith("*") and name.startswith(k[:-1]):
+            return v
+    return ""
+
+
+def hrirs():
+    """[(name, group, description)] for every HRIR on disk."""
+    out = []
+    main = DATA / "hrir"
+    info = _read_info(main / "info.csv")
+    for f in sorted(main.glob("*.wav"), key=lambda p: p.stem.lower()):
+        out.append((f.stem, "HeSuVi", _describe(f.stem, info)))
+    more = main / "more"
+    minfo = _read_info(more / "info.csv")
+    for f in sorted(more.glob("*.wav"), key=lambda p: p.stem.lower()):
+        out.append((f.stem, "Measured heads", _describe(f.stem, minfo)))
+    return out
+
+
+def eqs():
+    """[(id, label)] for the headphone EQs: none, FIR folders, then GraphicEQ files."""
+    out = [(EQ_NONE, "None")]
+    seen = set()
+    for fir in FIR_DIRS:
+        if not fir.is_dir():
+            continue
+        for d in sorted(
+            p for p in fir.iterdir() if p.is_dir() and any(p.glob("*.wav"))
+        ):
+            if d.name not in seen:
+                seen.add(d.name)
+                out.append((f"fir:{d.name}", f"{d.name} (FIR)"))
+    eqdir = DATA / "eq"
+    if eqdir.is_dir():
+        for f in sorted(eqdir.rglob("*.txt"), key=lambda p: str(p).lower()):
+            rel = f.relative_to(eqdir).with_suffix("")
+            out.append((f"graphic:{rel}", str(rel).replace("/", " / ")))
+    return out
+
+
+def outputs():
+    """[(node.name, description)] for the real audio sinks PipeWire has now."""
+    try:
+        dump = json.loads(
+            subprocess.run(
+                ["pw-dump"], capture_output=True, text=True, check=True
+            ).stdout
+        )
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return []
+    own = {NODE_IN, SINK_NODE}
+    out = []
+    for o in dump:
+        props = (o.get("info") or {}).get("props") or {}
+        if props.get("media.class") != "Audio/Sink":
+            continue
+        name = props.get("node.name", "")
+        # Real devices (ALSA, Bluetooth) belong to a device; filters do not.
+        if name in own or props.get("node.virtual") or "device.id" not in props:
+            continue
+        out.append((name, props.get("node.description", name)))
+    return out
+
+
+def matches(text, *fields):
+    """True when every word of text appears in one of the fields (any case)."""
+    hay = " ".join(fields).lower()
+    return all(w in hay for w in text.lower().split())
+
+
+def no_upmix_advised(name, desc=None):
+    if desc is None:
+        desc = dict((n, d) for n, _, d in hrirs()).get(name, "")
+    return "do not use any upmix" in desc.lower()
+
+
+def upmix_on(st):
+    if st["upmix"] == "on":
+        return True
+    if st["upmix"] == "off":
+        return False
+    return not no_upmix_advised(st["hrir"])
+
+
+# ---------------------------------------------------------------- DSP
+
+
+def _np():
+    import numpy as np
+
+    return np
+
+
+def read_wav(path):
+    """(rate, (n, channels) float64 in -1..1)."""
+    import scipy.io.wavfile as wavfile
+    import warnings
+
+    np = _np()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rate, d = wavfile.read(path)
+    if d.dtype == np.uint8:
+        d = (d.astype(np.float64) - 128.0) / 128.0
+    elif d.dtype.kind == "i":
+        d = d.astype(np.float64) / -float(np.iinfo(d.dtype).min)
+    d = np.asarray(d, dtype=np.float64)
+    if d.ndim == 1:
+        d = d[:, None]
+    if not np.all(np.isfinite(d)):
+        die(f"{path} has samples that are not finite numbers")
+    return int(rate), d
+
+
+def resample(d, src, dst):
+    """Resample an impulse response and keep its filter gain (scale by src/dst)."""
+    if src == dst:
+        return d
+    from math import gcd
+    from scipy.signal import resample_poly
+
+    g = gcd(src, dst)
+    return resample_poly(d, dst // g, src // g, axis=0) * (src / dst)
+
+
+def hrir_path(name, rate):
+    candidates = [
+        DATA / "hrir" / ("44" if rate == 44100 else "") / f"{name}.wav",
+        DATA / "hrir" / f"{name}.wav",
+        DATA / "hrir" / "more" / f"{name}.wav",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    die(f"no HRIR named {name!r} in {DATA / 'hrir'} (romklang list hrir)")
+
+
+def load_hrir(name, rate):
+    """HRIR as an (n, 14) array in LAYOUT14 order at the given rate."""
+    path = hrir_path(name, rate)
+    src, d = read_wav(path)
+    d = resample(d, src, rate)
+    if d.shape[1] == 14:
+        return d
+    if d.shape[1] == 7:
+        return d[:, SEVEN_TO_14]
+    die(f"{path} has {d.shape[1]} channels, expected 7 or 14")
+
+
+def parse_graphic_eq(text, where="GraphicEQ"):
+    """[(freq, dB)] from an Equalizer APO GraphicEQ line, sorted, validated."""
+    import math
+
+    for line in text.splitlines():
+        if not line.strip().lower().startswith("graphiceq:"):
+            continue
+        pts = {}
+        for pair in line.split(":", 1)[1].split(";"):
+            parts = pair.split()
+            if len(parts) != 2:
+                continue
+            try:
+                f, g = float(parts[0]), float(parts[1])
+            except ValueError:
+                die(f"{where}: bad point {pair.strip()!r}")
+            if not (math.isfinite(f) and math.isfinite(g)) or f <= 0:
+                die(f"{where}: bad point {pair.strip()!r}")
+            pts[f] = g
+        if pts:
+            return sorted(pts.items())
+    die(f"{where}: no GraphicEQ line")
+
+
+def min_phase_fir(points, rate, taps=EQ_TAPS, nfft=EQ_FFT):
+    """Minimum phase FIR whose magnitude follows (freq, dB) points.
+
+    Log-frequency interpolation, then the real-cepstrum method. Outside the
+    given points the end gains hold."""
+    np = _np()
+    f, g = np.array(points, dtype=np.float64).T
+    freqs = np.fft.rfftfreq(nfft, 1.0 / rate)
+    logf = np.log10(np.maximum(freqs, 1.0))
+    gain = np.interp(logf, np.log10(f), g)
+    logmag = gain * np.log(10) / 20.0
+    full = np.concatenate([logmag, logmag[-2:0:-1]])
+    cep = np.fft.ifft(full).real
+    fold = np.zeros(nfft)
+    fold[0] = cep[0]
+    fold[1 : nfft // 2] = 2 * cep[1 : nfft // 2]
+    fold[nfft // 2] = cep[nfft // 2]
+    h = np.fft.ifft(np.exp(np.fft.fft(fold))).real[:taps]
+    fade = taps // 8
+    h[-fade:] *= np.hanning(2 * fade)[fade:]
+    return h
+
+
+def fir_dir(name):
+    for f in FIR_DIRS:
+        if (f / name).is_dir():
+            return f / name
+    die(f"no FIR folder {name!r} in {' or '.join(str(f) for f in FIR_DIRS)}")
+
+
+def eq_sources(eq_id, rate):
+    """The files an EQ choice reads at this rate."""
+    kind, _, name = eq_id.partition(":")
+    if eq_id == EQ_NONE:
+        return []
+    if kind == "fir":
+        d = fir_dir(name)
+        for r in (rate, *RATES):
+            if (d / f"{r}.wav").exists():
+                return [d / f"{r}.wav"]
+        wavs = sorted(d.glob("*.wav"))
+        if wavs:
+            return wavs[:1]
+        die(f"no .wav in {d}")
+    if kind == "graphic":
+        path = DATA / "eq" / f"{name}.txt"
+        if not path.exists():
+            die(f"no EQ file {path}")
+        return [path]
+    die(f"unknown EQ {eq_id!r} (romklang list eq)")
+
+
+def load_eq(eq_id, rate):
+    """Headphone EQ as an (n, 2) array (left ear, right ear)."""
+    np = _np()
+    if eq_id == EQ_NONE:
+        return np.array([[1.0, 1.0]])
+    (path,) = eq_sources(eq_id, rate)
+    if eq_id.startswith("fir:"):
+        src, h = read_wav(path)
+        if h.shape[1] > 2:
+            die(f"{path} has {h.shape[1]} channels; a headphone FIR has 1 or 2")
+        h = resample(h, src, rate)
+        return h if h.shape[1] == 2 else np.repeat(h, 2, axis=1)
+    pts = parse_graphic_eq(path.read_text(errors="replace"), str(path))
+    h = min_phase_fir(pts, rate)
+    return np.stack([h, h], axis=1)
+
+
+def build_ir(st, rate):
+    """(n, 4) float32 IR: LtoL, LtoR, RtoL, RtoR.
+
+    Level: at gain 0 dB, the loudest steady tone of the worst case (both inputs
+    in phase into one ear) just reaches full scale. Music with transients can
+    still peak above that, and gain above 0 dB raises it further."""
+    np = _np()
+    from scipy.signal import fftconvolve
+
+    hrir = load_hrir(st["hrir"], rate)
+    eq = load_eq(st["eq"], rate)
+    weights = UPMIX if upmix_on(st) else NO_UPMIX
+    paths = []
+    for in_idx in (0, 1):
+        for ear_idx, ear in enumerate(("L", "R")):
+            ear_ir = np.zeros(hrir.shape[0])
+            for col, (spk, e) in enumerate(LAYOUT14):
+                if e == ear and spk in weights:
+                    ear_ir += weights[spk][in_idx] * hrir[:, col]
+            paths.append(fftconvolve(ear_ir, eq[:, ear_idx]))
+    n = max(len(p) for p in paths)
+    ir = np.zeros((n, 4))
+    for i, p in enumerate(paths):
+        ir[: len(p), i] = p
+    nfft = 1 << int(np.ceil(np.log2(max(n, 2) * 2)))
+    spec = np.abs(np.fft.rfft(ir, nfft, axis=0))
+    worst = max((spec[:, 0] + spec[:, 2]).max(), (spec[:, 1] + spec[:, 3]).max())
+    if not np.isfinite(worst) or worst <= 0:
+        die(f"the filter for {st['hrir']} + {st['eq']} is silent or broken")
+    ir *= 10 ** (float(st["gain_db"]) / 20.0) / worst
+    energy = np.abs(ir).max(axis=1)
+    keep = np.nonzero(energy > energy.max() * TRIM_REL)[0]
+    ir = ir[: keep[-1] + 1]
+    return ir.astype(np.float32)
+
+
+def manifest_for(st):
+    """What the IR files depend on: settings, renderer version, source files."""
+    sources = {}
+    for rate in RATES:
+        for p in [hrir_path(st["hrir"], rate), *eq_sources(st["eq"], rate)]:
+            s = p.stat()
+            sources[str(p)] = [s.st_size, s.st_mtime_ns]
+    return {
+        "render_version": RENDER_VERSION,
+        "hrir": st["hrir"],
+        "eq": st["eq"],
+        "upmix": upmix_on(st),
+        "gain_db": round(float(st["gain_db"]), 3),
+        "sources": sources,
+    }
+
+
+def built_manifest():
+    try:
+        return json.loads(MANIFEST.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------- PipeWire
+
+
+def q(s):
+    """A PipeWire config string literal (SPA JSON takes JSON strings)."""
+    return json.dumps(str(s))
+
+
+def pw_conf(st):
+    target = st["output"]
+    if not target:
+        # The default sink is normally romklang's own stable sink, so following
+        # it would feed the convolver back into itself.
+        die(
+            "no output device set (romklang list outputs, then romklang set --output NODE)"
+        )
+    files = " ".join(q(ACTIVE / f"ir-{r}.wav") for r in RATES)
+    conv = "\n".join(
+        f"                    {{ type = builtin label = convolver name = {n} "
+        f"config = {{ filename = [ {files} ] channel = {i} }} }}"
+        for i, n in enumerate(("LtoL", "LtoR", "RtoL", "RtoR"))
+    )
+    return f"""# Generated by romklang. Do not edit: romklang render rewrites it.
+# Run by {UNIT}. The stable sink apps use lives elsewhere (romklang setup).
+context.properties = {{
+    # Warnings and errors only, so a filter that fails to load shows in the journal.
+    log.level = 2
+}}
+context.spa-libs = {{
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}}
+context.modules = [
+    {{ name = libpipewire-module-rt args = {{ }} flags = [ ifexists nofail ] }}
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+    {{ name = libpipewire-module-filter-chain
+        args = {{
+            node.description = "romklang convolver"
+            media.name       = "romklang convolver"
+            filter.graph = {{
+                nodes = [
+                    {{ type = builtin label = copy name = inL }}
+                    {{ type = builtin label = copy name = inR }}
+{conv}
+                    {{ type = builtin label = mixer name = earL }}
+                    {{ type = builtin label = mixer name = earR }}
+                ]
+                links = [
+                    {{ output = "inL:Out" input = "LtoL:In" }}
+                    {{ output = "inL:Out" input = "LtoR:In" }}
+                    {{ output = "inR:Out" input = "RtoL:In" }}
+                    {{ output = "inR:Out" input = "RtoR:In" }}
+                    {{ output = "LtoL:Out" input = "earL:In 1" }}
+                    {{ output = "RtoL:Out" input = "earL:In 2" }}
+                    {{ output = "LtoR:Out" input = "earR:In 1" }}
+                    {{ output = "RtoR:Out" input = "earR:In 2" }}
+                ]
+                inputs  = [ "inL:In" "inR:In" ]
+                outputs = [ "earL:Out" "earR:Out" ]
+            }}
+            capture.props = {{
+                node.name      = {q(NODE_IN)}
+                media.class    = Audio/Sink
+                # Hidden: apps use the stable sink, which feeds this one.
+                node.virtual   = true
+                priority.session = 1
+                audio.channels = 2
+                audio.position = [ FL FR ]
+            }}
+            playback.props = {{
+                node.name      = {q(NODE_OUT)}
+                node.passive   = true
+                audio.channels = 2
+                audio.position = [ FL FR ]
+                target.object  = {q(target)}
+                # Wait for the device (late at boot, unplugged) instead of falling
+                # back to the default sink, which feeds this filter. Without
+                # node.linger WirePlumber destroys the stream instead of waiting.
+                node.dont-fallback = true
+                node.linger        = true
+            }}
+        }}
+    }}
+]
+"""
+
+
+def sink_conf(description):
+    return f"""# Generated by romklang setup. The stable sink apps play into.
+# A loopback into romklang's hidden convolver sink ({NODE_IN}), which
+# {UNIT} runs. Switching HRIR or EQ restarts only that service, so apps
+# keep this sink. Loaded by the main PipeWire daemon.
+context.modules = [
+    {{ name = libpipewire-module-loopback
+        flags = [ nofail ]
+        args = {{
+            node.description = {q(description)}
+            media.name       = {q(description)}
+            audio.channels   = 2
+            audio.position   = [ FL FR ]
+            capture.props = {{
+                node.name        = {q(SINK_NODE)}
+                media.class      = Audio/Sink
+                # Desktop volume applets often hide virtual sinks.
+                node.virtual     = false
+                priority.session = 2000
+            }}
+            playback.props = {{
+                node.name      = {q(SINK_STREAM)}
+                node.passive   = true
+                target.object  = {q(NODE_IN)}
+                # While {UNIT} restarts, wait for the convolver instead of
+                # falling back to the default sink, which is this sink itself.
+                node.dont-fallback = true
+                node.linger        = true
+            }}
+        }}
+    }}
+]
+"""
+
+
+def render(st, if_stale=False):
+    """Write the PipeWire config and, unless they are current, the IR files."""
+    with locked():
+        _write_conf(st)
+        want = manifest_for(st)
+        if (
+            if_stale
+            and built_manifest() == want
+            and all((ACTIVE / f"ir-{r}.wav").exists() for r in RATES)
+        ):
+            return False
+        import io
+        import scipy.io.wavfile as wavfile
+
+        irs = {rate: build_ir(st, rate) for rate in RATES}
+        for rate, ir in irs.items():
+            buf = io.BytesIO()
+            wavfile.write(buf, rate, ir)
+            _write_atomic(ACTIVE / f"ir-{rate}.wav", buf.getvalue())
+        _write_atomic(MANIFEST, json.dumps(want, indent=2) + "\n")
+        return True
+
+
+def _write_conf(st):
+    conf = pw_conf(st)
+    if not PW_CONF.exists() or PW_CONF.read_text() != conf:
+        _write_atomic(PW_CONF, conf)
+
+
+def systemctl(*args, check=True):
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if check and r.returncode:
+        die(f"systemctl --user {' '.join(args)} failed: {r.stderr.strip()}")
+    return r
+
+
+def node_exists(name):
+    try:
+        dump = json.loads(
+            subprocess.run(["pw-dump"], capture_output=True, text=True).stdout
+        )
+    except (OSError, ValueError):
+        return None
+    return any(
+        ((o.get("info") or {}).get("props") or {}).get("node.name") == name
+        for o in dump
+    )
+
+
+def restart_unit(wait=5.0):
+    systemctl("restart", UNIT)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        found = node_exists(NODE_IN)
+        if found or found is None:
+            return
+        time.sleep(0.2)
+    die(f"{UNIT} restarted but {NODE_IN} did not appear (journalctl --user -u {UNIT})")
+
+
+def apply(user):
+    """Save the user's choices, build the filter and restart the convolver."""
+    st = dict(BASE_STATE)
+    st.update(_read_json(DEFAULTS))
+    st.update(user)
+    check_state(st)
+    render(st, if_stale=True)
+    with locked():
+        save_user_state(user)
+    restart_unit()
+    return st
+
+
+# ---------------------------------------------------------------- CLI
+
+
+def resolve(kind, text):
+    if kind == "hrir":
+        items = [(n, n, d) for n, _, d in hrirs()]
+    else:
+        items = [(i, label, "") for i, label in eqs()]
+    for i, label, _ in items:
+        if text in (i, label):
+            return i
+    hits = [i for i, label, _ in items if matches(text, i, label)]
+    if not hits:
+        hits = [i for i, label, d in items if matches(text, i, label, d)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die(f"no {kind} matches {text!r} (romklang list {kind} TEXT)")
+    shown = "\n  ".join(hits[:15])
+    more = f"\n  ... and {len(hits) - 15} more" if len(hits) > 15 else ""
+    die(f"{len(hits)} {kind} entries match {text!r}:\n  {shown}{more}")
+
+
+def unit_started_at():
+    r = systemctl(
+        "show", "-p", "ActiveEnterTimestamp", "--timestamp=unix", UNIT, check=False
+    )
+    v = r.stdout.strip().partition("=")[2]
+    return float(v[1:]) if v.startswith("@") else None
+
+
+def cmd_status(_):
+    st = load_state()
+    print(
+        f"HRIR:   {st['hrir']}  (upmix {st['upmix']}, now {'on' if upmix_on(st) else 'off'})"
+    )
+    print(f"EQ:     {st['eq']}")
+    print(f"Gain:   {st['gain_db']:+.1f} dB")
+    print(f"Output: {st['output'] or 'not set (romklang list outputs)'}")
+    active = systemctl("is-active", UNIT, check=False).stdout.strip()
+    print(f"{UNIT}: {active}")
+    try:
+        want = manifest_for(st)
+    except SystemExit as e:
+        print(f"Problem: {e}")
+        return
+    if built_manifest() != want:
+        print(
+            "Note: the filter files are from other settings or older sources (romklang set rebuilds)."
+        )
+    started = unit_started_at()
+    if (
+        active == "active"
+        and started
+        and MANIFEST.exists()
+        and MANIFEST.stat().st_mtime > started
+    ):
+        print(
+            f"Note: the filter was rebuilt after {UNIT} started; restart it to hear the change."
+        )
+
+
+def cmd_list(a):
+    t = a.text or ""
+    if a.what == "hrir":
+        for n, group, desc in hrirs():
+            first = desc.splitlines()[0] if desc else ""
+            if matches(t, n, desc):
+                print(f"{n:<14} {group:<15} {first}")
+    elif a.what == "eq":
+        for i, label in eqs():
+            if matches(t, i, label):
+                print(i)
+    else:
+        for name, desc in outputs():
+            if matches(t, name, desc):
+                print(f"{name}    {desc}")
+
+
+def cmd_set(a):
+    user = load_user_state()
+    if a.hrir:
+        user["hrir"] = resolve("hrir", a.hrir)
+    if a.eq:
+        user["eq"] = resolve("eq", a.eq)
+    if a.upmix:
+        user["upmix"] = a.upmix
+    if a.gain is not None:
+        user["gain_db"] = a.gain
+    if a.output is not None:
+        user["output"] = a.output
+    for k in a.reset or []:
+        user.pop(k, None)
+    apply(user)
+    cmd_status(a)
+
+
+def cmd_render(a):
+    render(load_state(), if_stale=a.if_stale)
+
+
+def cmd_import(a):
+    src = Path(a.dir)
+    if not (src / "hrir").is_dir():
+        die(
+            f"{src} has no hrir/ folder (point at the HeSuVi folder inside Equalizer APO's config)"
+        )
+    DATA.mkdir(parents=True, exist_ok=True)
+    for sub in ("hrir", "eq"):
+        if (src / sub).is_dir():
+            shutil.copytree(src / sub, DATA / sub, dirs_exist_ok=True)
+            print(f"copied {src / sub} -> {DATA / sub}")
+
+
+def cmd_setup(a):
+    if not (DATA / "hrir").is_dir():
+        die(f"no HRIRs in {DATA / 'hrir'} yet (romklang import HESUVI_DIR)")
+    user = load_user_state()
+    if a.output:
+        user["output"] = a.output
+    st = dict(BASE_STATE)
+    st.update(_read_json(DEFAULTS))
+    st.update(user)
+    if not st["output"]:
+        found = outputs()
+        lines = "\n  ".join(f"{n}    {d}" for n, d in found) or "(none found)"
+        die(f"pick the real output device with --output NODE. Sinks now:\n  {lines}")
+    if not a.no_sink:
+        _write_atomic(SINK_CONF, sink_conf(a.name))
+        print(f"wrote {SINK_CONF}")
+    check_state(st)
+    render(st)
+    with locked():
+        save_user_state(user)
+    systemctl("daemon-reload")
+    systemctl("enable", "--now", UNIT)
+    print(f"enabled {UNIT}")
+    if not a.no_sink:
+        print(
+            "Restart PipeWire once to load the new sink "
+            "(systemctl --user restart pipewire, or log out and in), then pick "
+            f'"{a.name}" as the output in your desktop.'
+        )
+
+
+def cmd_gui(_):
+    gui_main()
+
+
+# ---------------------------------------------------------------- GUI
+
+
+def gui_main():
+    from PySide6.QtCore import QProcess, Qt, QTimer
+    from PySide6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QComboBox,
+        QDoubleSpinBox,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QListWidget,
+        QListWidgetItem,
+        QPushButton,
+        QSplitter,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("romklang")
+    app.setDesktopFileName("romklang")
+    st = load_state()
+    hrir_list = hrirs()
+    eq_list = eqs()
+
+    win = QWidget()
+    win.setWindowTitle("romklang")
+    win.resize(1100, 720)
+    root = QVBoxLayout(win)
+
+    def picker(title, placeholder):
+        box = QGroupBox(title)
+        lay = QVBoxLayout(box)
+        search = QLineEdit()
+        search.setPlaceholderText(placeholder)
+        search.setClearButtonEnabled(True)
+        lst = QListWidget()
+        lay.addWidget(search)
+        lay.addWidget(lst, 1)
+        return box, lay, search, lst
+
+    hbox, hlay, hsearch, hlst = picker(
+        "Virtual surround (HRIR)", "Search HRIRs and descriptions"
+    )
+    hdesc = QLabel()
+    hdesc.setWordWrap(True)
+    hdesc.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    hdesc.setMinimumHeight(90)
+    hdesc.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+    hlay.addWidget(hdesc)
+    ebox, elay, esearch, elst = picker("Headphone EQ", "Search brand or model")
+    ecount = QLabel()
+    elay.addWidget(ecount)
+
+    split = QSplitter()
+    split.addWidget(hbox)
+    split.addWidget(ebox)
+    split.setSizes([500, 600])
+    root.addWidget(split, 1)
+
+    row = QHBoxLayout()
+    row.addWidget(QLabel("Upmix"))
+    upmix = QComboBox()
+    for v, label in (("auto", "Auto"), ("on", "On (stereo to 7.1)"), ("off", "Off")):
+        upmix.addItem(label, v)
+    upmix.setCurrentIndex(max(0, upmix.findData(st["upmix"])))
+    row.addWidget(upmix)
+    row.addSpacing(16)
+    row.addWidget(QLabel("Gain"))
+    gain = QDoubleSpinBox()
+    gain.setRange(-30.0, 20.0)
+    gain.setSingleStep(0.5)
+    gain.setSuffix(" dB")
+    gain.setValue(float(st["gain_db"]))
+    gain.setToolTip(
+        "0 dB: the loudest steady tone just reaches full scale.\n"
+        "Music can still peak above that. Lower the gain if you hear distortion."
+    )
+    row.addWidget(gain)
+    row.addSpacing(16)
+    auto = QCheckBox("Apply on select")
+    auto.setChecked(True)
+    row.addWidget(auto)
+    row.addStretch(1)
+    status = QLabel()
+    row.addWidget(status)
+    applyb = QPushButton("Apply")
+    applyb.setDefault(True)
+    row.addWidget(applyb)
+    root.addLayout(row)
+
+    current = QLabel()
+    current.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    root.addWidget(current)
+
+    def fill_hrirs():
+        text = hsearch.text()
+        hlst.blockSignals(True)
+        hlst.clear()
+        group = None
+        for n, g, desc in hrir_list:
+            if not matches(text, n, desc):
+                continue
+            if g != group:
+                head = QListWidgetItem(g)
+                head.setFlags(Qt.ItemFlag.NoItemFlags)
+                f = head.font()
+                f.setBold(True)
+                head.setFont(f)
+                hlst.addItem(head)
+                group = g
+            first = desc.splitlines()[0] if desc else ""
+            it = QListWidgetItem(f"{n}    {first}" if first else n)
+            it.setData(Qt.ItemDataRole.UserRole, n)
+            it.setToolTip(desc)
+            hlst.addItem(it)
+            if n == st["hrir"]:
+                hlst.setCurrentItem(it)
+        hlst.blockSignals(False)
+        show_desc()
+
+    def fill_eqs():
+        text = esearch.text()
+        elst.blockSignals(True)
+        elst.clear()
+        shown = 0
+        for i, label in eq_list:
+            if not matches(text, label):
+                continue
+            it = QListWidgetItem(label)
+            it.setData(Qt.ItemDataRole.UserRole, i)
+            elst.addItem(it)
+            shown += 1
+            if i == st["eq"]:
+                elst.setCurrentItem(it)
+        elst.blockSignals(False)
+        ecount.setText(f"{shown} of {len(eq_list)} shown")
+
+    def item_value(lst, fallback):
+        it = lst.currentItem()
+        v = it.data(Qt.ItemDataRole.UserRole) if it else None
+        return v if v else fallback
+
+    def show_desc():
+        n = item_value(hlst, None)
+        desc = dict((a, d) for a, _, d in hrir_list).get(n, "")
+        hdesc.setText(f"<b>{n}</b><br>{desc.replace(chr(10), '<br>')}" if n else "")
+
+    def show_current():
+        s = load_state()
+        current.setText(
+            f"Active: {s['hrir']}  +  {dict(eq_list).get(s['eq'], s['eq'])}  "
+            f"(upmix {'on' if upmix_on(s) else 'off'}, gain {s['gain_db']:+.1f} dB)"
+            f"  ->  {s['output'] or 'no output set'}"
+        )
+
+    proc = QProcess(win)
+    pending: dict = {"again": False, "req": None}
+    debounce = QTimer(win)
+    debounce.setSingleShot(True)
+    debounce.setInterval(350)
+
+    def do_apply():
+        debounce.stop()
+        if proc.state() != QProcess.ProcessState.NotRunning:
+            pending["again"] = True
+            return
+        req = dict(
+            hrir=item_value(hlst, st["hrir"]),
+            eq=item_value(elst, st["eq"]),
+            upmix=upmix.currentData(),
+            gain_db=gain.value(),
+        )
+        pending["req"] = req
+        status.setText("Building...")
+        applyb.setEnabled(False)
+        proc.start(
+            sys.executable,
+            [
+                os.path.abspath(__file__),
+                "set",
+                "--hrir",
+                str(req["hrir"]),
+                "--eq",
+                str(req["eq"]),
+                "--upmix",
+                str(req["upmix"]),
+                "--gain",
+                str(req["gain_db"]),
+            ],
+        )
+
+    def finish(ok, msg):
+        applyb.setEnabled(True)
+        if ok and pending["req"]:
+            st.update(pending["req"])
+        status.setText(msg)
+        show_current()
+        if pending["again"]:
+            pending["again"] = False
+            do_apply()
+
+    def done(code, _status):
+        if code == 0:
+            finish(True, "Applied")
+        else:
+            err = (
+                bytes(proc.readAllStandardError().data())
+                .decode(errors="replace")
+                .strip()
+            )
+            finish(
+                False, "Failed: " + (err.splitlines()[-1] if err else f"exit {code}")
+            )
+
+    def failed(_err):
+        if proc.state() == QProcess.ProcessState.NotRunning:
+            finish(False, f"Failed: {proc.errorString()}")
+
+    def maybe_apply():
+        if auto.isChecked():
+            debounce.start()
+
+    debounce.timeout.connect(do_apply)
+    proc.finished.connect(done)
+    proc.errorOccurred.connect(failed)
+    hsearch.textChanged.connect(fill_hrirs)
+    esearch.textChanged.connect(fill_eqs)
+    hlst.currentItemChanged.connect(lambda *_: (show_desc(), maybe_apply()))
+    elst.currentItemChanged.connect(lambda *_: maybe_apply())
+    upmix.currentIndexChanged.connect(lambda *_: maybe_apply())
+    gain.editingFinished.connect(maybe_apply)
+    applyb.clicked.connect(do_apply)
+
+    fill_hrirs()
+    fill_eqs()
+    show_current()
+    if os.environ.get("ROMKLANG_GUI_SCREENSHOT"):
+        win.show()
+        app.processEvents()
+        win.grab().save(os.environ["ROMKLANG_GUI_SCREENSHOT"])
+        return
+    win.show()
+    sys.exit(app.exec())
+
+
+def main():
+    p = argparse.ArgumentParser(prog="romklang", description=__doc__.split("\n")[0])
+    p.add_argument("--version", action="version", version=f"romklang {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("status", help="show the current choice").set_defaults(fn=cmd_status)
+    s = sub.add_parser("list", help="list HRIRs, EQs or output devices")
+    s.add_argument("what", choices=["hrir", "eq", "outputs"])
+    s.add_argument("text", nargs="?", help="words that must all match")
+    s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("set", help="pick and apply")
+    s.add_argument("--hrir")
+    s.add_argument("--eq")
+    s.add_argument("--upmix", choices=["auto", "on", "off"])
+    s.add_argument(
+        "--gain", type=float, help="dB relative to the steady-tone full-scale level"
+    )
+    s.add_argument(
+        "--output", help="node.name of the real output device (romklang list outputs)"
+    )
+    s.add_argument(
+        "--reset",
+        nargs="+",
+        choices=list(BASE_STATE),
+        help="forget your own value and use the default again",
+    )
+    s.set_defaults(fn=cmd_set)
+    s = sub.add_parser("setup", help="one-time: stable sink, output device, service")
+    s.add_argument("--output", help="node.name of the real output device")
+    s.add_argument(
+        "--name",
+        default="Virtual surround (romklang)",
+        help="sink name shown in the desktop",
+    )
+    s.add_argument(
+        "--no-sink", action="store_true", help="you provide the stable sink yourself"
+    )
+    s.set_defaults(fn=cmd_setup)
+    s = sub.add_parser("render", help="write the config and IRs (the unit runs this)")
+    s.add_argument(
+        "--if-stale", action="store_true", help="keep IR files that match the settings"
+    )
+    s.set_defaults(fn=cmd_render)
+    s = sub.add_parser("import", help="copy hrir/ and eq/ from a HeSuVi install")
+    s.add_argument("dir")
+    s.set_defaults(fn=cmd_import)
+    sub.add_parser("gui", help="the picker window").set_defaults(fn=cmd_gui)
+    a = p.parse_args()
+    if not a.cmd:
+        p.print_help()
+        return
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

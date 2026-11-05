@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=romklang
+GenericName=Virtual Surround
+Comment=Pick a virtual surround HRIR and a headphone EQ
+Exec=romklang gui
+Icon=audio-headphones
+Categories=AudioVideo;Audio;Settings;
+Keywords=hesuvi;hrir;surround;headphone;eq;autoeq;pipewire;
