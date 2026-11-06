@@ -5,11 +5,11 @@ After=pipewire.service
 BindsTo=pipewire.service
 
 [Service]
-# Rebuild the impulse responses if the settings or source files changed.
-ExecStartPre=%h/.local/bin/romklang render --if-stale
-ExecStart=/usr/bin/pipewire -c romklang.conf
-Restart=on-failure
-RestartSec=2
+# Starts romklang@a or romklang@b, whichever slot is current. Those units are
+# PartOf this one, so stopping or restarting this one does the same to them.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/romklang start
 Slice=session.slice
 
 [Install]

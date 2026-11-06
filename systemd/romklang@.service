@@ -1,0 +1,14 @@
+[Unit]
+Description=romklang convolver, slot %i
+Documentation=https://github.com/oysteinkrog/romklang
+# romklang.service starts the current slot. A switch starts the other slot,
+# moves the stream to it and stops this one.
+PartOf=romklang.service
+After=pipewire.service
+BindsTo=pipewire.service
+
+[Service]
+ExecStart=/usr/bin/pipewire -c romklang-%i.conf
+Restart=on-failure
+RestartSec=2
+Slice=session.slice

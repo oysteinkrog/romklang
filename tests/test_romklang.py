@@ -149,3 +149,37 @@ def test_render_skips_when_current(rk):
     assert rk.render(st, if_stale=True) is False
     st["gain_db"] = -3.0
     assert rk.render(st, if_stale=True) is True
+
+
+def test_slots_share_node_name_but_not_files(rk):
+    a = rk.pw_conf(dict(rk.BASE_STATE, output="dac"), "a")
+    b = rk.pw_conf(dict(rk.BASE_STATE, output="dac"), "b")
+    for conf, slot in ((a, "a"), (b, "b")):
+        assert f'node.name      = "{rk.NODE_IN}"' in conf
+        assert f'romklang.slot  = "{slot}"' in conf
+        assert str(rk.slot_dir(slot) / "ir-48000.wav") in conf
+    assert rk.other_slot("a") == "b" and rk.other_slot("b") == "a"
+
+
+def test_feeding_streams_finds_target_and_linked_streams(rk):
+    def node(i, **props):
+        return {"id": i, "type": "PipeWire:Interface:Node", "info": {"props": props}}
+
+    def link(out, inp):
+        return {
+            "id": 900 + out,
+            "type": "PipeWire:Interface:Link",
+            "info": {"output-node-id": out, "input-node-id": inp},
+        }
+
+    dump = [
+        node(10, **{"media.class": "Audio/Sink", "romklang.slot": "a"}),
+        node(20, **{"media.class": "Stream/Output/Audio", "target.object": rk.NODE_IN}),
+        node(30, **{"media.class": "Stream/Output/Audio"}),
+        node(40, **{"media.class": "Stream/Output/Audio"}),
+        node(50, **{"media.class": "Audio/Sink"}),
+        link(30, 10),
+        link(40, 50),
+    ]
+    assert rk.feeding_streams(dump) == {20, 30}
+    assert rk.linked_to(30, 10, dump) and not rk.linked_to(40, 10, dump)
